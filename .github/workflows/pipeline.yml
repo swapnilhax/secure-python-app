@@ -1,0 +1,253 @@
+name: Secure Python App Pipeline
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: secure-python-app
+  PYTHON_VERSION: '3.11'
+
+jobs:
+
+  # ════════════════════════════════════════════
+  # JOB 1 — TEST
+  # ════════════════════════════════════════════
+  test:
+    name: Test Application
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Get Code ──────────────────────────
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # ── Setup Python ──────────────────────
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      # ── Install Dependencies ───────────────
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── Show Environment ───────────────────
+      - name: Show Environment Info
+        run: |
+          echo "Python version:"
+          python --version
+          echo "Pip packages:"
+          pip list
+          echo "Current directory:"
+          ls -la
+
+      # ── Run Tests ─────────────────────────
+      - name: Run Tests with Coverage
+        run: |
+          pytest tests/ \
+            --verbose \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term-missing
+
+      # ── Upload Coverage ────────────────────
+      - name: Upload Coverage Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  # ════════════════════════════════════════════
+  # JOB 2 — HARDCODED CREDENTIAL CHECK
+  # ════════════════════════════════════════════
+  secret-scan:
+    name: Secret Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history scan
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ════════════════════════════════════════════
+  # JOB 3 — DOCKER BUILD + INSPECT
+  # ════════════════════════════════════════════
+  docker:
+    name: Docker Build + Inspect
+    runs-on: ubuntu-latest
+    needs: [test, secret-scan]
+
+    steps:
+      # ── Get Code ──────────────────────────
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # ── Show Git SHA ───────────────────────
+      - name: Show Git SHA
+        run: |
+          echo "Full SHA:  ${{ github.sha }}"
+          echo "Short SHA: ${GITHUB_SHA::7}"
+          echo "Branch:    ${{ github.ref_name }}"
+          echo "Actor:     ${{ github.actor }}"
+
+      # ── Build Image with Git SHA Tag ───────
+      - name: Build Docker Image
+        run: |
+          docker build \
+            --tag ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --tag ${{ env.IMAGE_NAME }}:latest \
+            --label "git-sha=${{ github.sha }}" \
+            --label "build-date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --label "branch=${{ github.ref_name }}" \
+            .
+
+      # ── Inspect Image ──────────────────────
+      - name: Inspect Image
+        run: |
+          echo "════ IMAGE LIST ════"
+          docker images | grep ${{ env.IMAGE_NAME }}
+
+          echo ""
+          echo "════ IMAGE DETAILS ════"
+          docker inspect ${{ env.IMAGE_NAME }}:latest
+
+          echo ""
+          echo "════ IMAGE LABELS ════"
+          docker inspect \
+            --format='{{json .Config.Labels}}' \
+            ${{ env.IMAGE_NAME }}:latest \
+            | python3 -m json.tool
+
+          echo ""
+          echo "════ IMAGE SIZE ════"
+          docker inspect \
+            --format='Size: {{.Size}} bytes' \
+            ${{ env.IMAGE_NAME }}:latest
+
+          echo ""
+          echo "════ IMAGE LAYERS ════"
+          docker history ${{ env.IMAGE_NAME }}:latest
+
+          echo ""
+          echo "════ IMAGE ENV VARS ════"
+          docker inspect \
+            --format='{{json .Config.Env}}' \
+            ${{ env.IMAGE_NAME }}:latest \
+            | python3 -m json.tool
+
+      # ── Test Container Runs ────────────────
+      - name: Test Container
+        run: |
+          echo "Starting container..."
+          docker run -d \
+            --name test-container \
+            -p 5000:5000 \
+            -e APP_VERSION=${{ github.sha }} \
+            -e APP_ENV=testing \
+            ${{ env.IMAGE_NAME }}:latest
+
+          echo "Waiting for app to start..."
+          sleep 5
+
+          echo "Testing health endpoint..."
+          curl -f http://localhost:5000/health
+
+          echo ""
+          echo "Testing home endpoint..."
+          curl -f http://localhost:5000/
+
+          echo ""
+          echo "Testing add endpoint..."
+          curl -f http://localhost:5000/add/3/4
+
+          echo ""
+          echo "Container logs:"
+          docker logs test-container
+
+          echo ""
+          echo "Stopping container..."
+          docker stop test-container
+          docker rm test-container
+
+      # ── Cache Risk Demo ────────────────────
+      - name: Show Cache Risk
+        run: |
+          echo "════ CACHE RISK DEMO ════"
+          echo ""
+          echo "BAD — Hardcoded credentials in image:"
+          echo "These would be visible to anyone:"
+          docker history --no-trunc ${{ env.IMAGE_NAME }}:latest
+          echo ""
+          echo "GOOD — We use ENV VARS:"
+          echo "APP_VERSION passed at runtime"
+          echo "SECRET_KEY from GitHub Secrets"
+          echo "Never hardcoded in Dockerfile"
+
+      # ── Save Image ─────────────────────────
+      - name: Save Image as Artifact
+        run: |
+          docker save ${{ env.IMAGE_NAME }}:latest \
+            -o ${{ env.IMAGE_NAME }}.tar
+
+      - name: Upload Image Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: ${{ env.IMAGE_NAME }}.tar
+          retention-days: 1
+
+  # ════════════════════════════════════════════
+  # JOB 4 — ENVIRONMENT VARIABLES DEMO
+  # ════════════════════════════════════════════
+  env-demo:
+    name: Environment Variables Demo
+    runs-on: ubuntu-latest
+    needs: docker
+
+    env:
+      APP_VERSION: "1.0.0"
+      APP_ENV: "production"
+
+    steps:
+      - name: Show Safe vs Unsafe
+        run: |
+          echo "════ SAFE — GitHub Secrets ════"
+          echo "Use secrets for sensitive data"
+          echo "Secret value: ${{ secrets.GITHUB_TOKEN }}"
+          echo "(shows as *** in logs)"
+
+          echo ""
+          echo "════ SAFE — Environment Variables ════"
+          echo "APP_VERSION: ${{ env.APP_VERSION }}"
+          echo "APP_ENV: ${{ env.APP_ENV }}"
+          echo "IMAGE: ${{ env.IMAGE_NAME }}"
+
+          echo ""
+          echo "════ SAFE — GitHub Context ════"
+          echo "SHA: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Run ID: ${{ github.run_id }}"
+          echo "Run Number: ${{ github.run_number }}"
+
+          echo ""
+          echo "════ UNSAFE — Never do this ════"
+          echo "Never put passwords in workflow:"
+          echo "password: mypassword123  ← BAD"
+          echo "api_key: sk-abc123      ← BAD"
+          echo "Always use secrets.*    ← GOOD"
+
